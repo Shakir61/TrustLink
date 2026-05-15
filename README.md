@@ -146,6 +146,7 @@ The platform is purpose-built for **freelancers**, **online marketplaces**, **so
 
 - **JazzCash** — Pakistan's leading mobile wallet (API v2.0)
 - **EasyPaisa** — Mobile money and bank transfer gateway
+- **NayaPay** — Mobile money and digital banking system
 - **HBL PayConnect** — Bank-grade card and account payment gateway
 - **1Link** — Interbank Fund Transfer (IBFT) support for bank-to-escrow deposits
 - **Stripe (optional)** — International card payments for cross-border escrow
@@ -234,6 +235,7 @@ The platform is purpose-built for **freelancers**, **online marketplaces**, **so
 |---|---|
 | **JazzCash REST API** | Mobile wallet deposits/withdrawals |
 | **EasyPaisa API** | Mobile wallet and OTC payments |
+| **NayaPay** | Mobile wallet and digital system |
 | **HBL PayConnect** | Card and bank account payments |
 | **1Link IBFT** | Interbank transfers |
 | **Stripe (optional)** | International card payments |
@@ -323,7 +325,7 @@ The NestJS backend is organized into domain modules, each encapsulating its own 
 PostgreSQL serves as the single source of truth for all transactional data. TypeORM manages entity definitions, relations, and migrations. All financial operations are executed within database transactions to guarantee ACID compliance. Redis is used for ephemeral state: session tokens, rate limit counters, job queues, and computed cache values.
 
 **Payment Gateway Layer**
-Payment integrations are abstracted behind a `PaymentGatewayService` interface. Each gateway (JazzCash, EasyPaisa, HBL) is implemented as a strategy. This allows switching or adding gateways without modifying escrow business logic. Webhook handlers validate HMAC signatures before processing any payment confirmation event.
+Payment integrations are abstracted behind a `PaymentGatewayService` interface. Each gateway (JazzCash,NayaPay, EasyPaisa, HBL) is implemented as a strategy. This allows switching or adding gateways without modifying escrow business logic. Webhook handlers validate HMAC signatures before processing any payment confirmation event.
 
 **Admin Services**
 The admin module exposes privileged endpoints accessible only to users with `ADMIN`, `MODERATOR`, or `COMPLIANCE_OFFICER` roles. Admin actions are doubly logged — at the application audit layer and optionally at the database `pg_audit` layer.
@@ -433,7 +435,7 @@ BUYER                         TrustLink                         SELLER
   │  3. Deposit Funds             │                               │
   │──────────────────────────────▶│                               │
   │  (via JazzCash / EasyPaisa /  │                               │
-  │   Bank Transfer)              │                               │
+  │  NayaPay / Bank Transfer)              │                               │
   │                               │  4. Confirm Funding           │
   │                               │──────────────────────────────▶│
   │                               │   [Status: IN_PROGRESS]       │
