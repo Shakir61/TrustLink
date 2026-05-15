@@ -1,4 +1,4 @@
-# PakEscrow 🔐
+# TrustLink 🔐
 
 > **Pakistan's trusted digital escrow infrastructure — securing transactions between buyers and sellers across freelance, commerce, and B2B markets.**
 ## Table of Contents
@@ -26,16 +26,16 @@ The result is systemic:
 
 This trust gap suppresses transaction volumes, increases friction, and ultimately limits economic participation.
 
-### The Solution: PakEscrow
+### The Solution: TrustLink
 
-**PakEscrow** is a digital escrow platform designed specifically for the Pakistani market. Inspired by the operational model of [Transpact](https://www.transpact.com) (UK), PakEscrow introduces a structured, technology-driven escrow layer that sits between transacting parties and acts as a neutral custodian of funds.
+**TrustLink** is a digital escrow platform designed specifically for the Pakistani market. Inspired by the operational model of [Transpact](https://www.transpact.com) (UK), TrustLink introduces a structured, technology-driven escrow layer that sits between transacting parties and acts as a neutral custodian of funds.
 
 When a transaction is initiated:
 1. The buyer deposits funds into a secure, platform-held escrow wallet.
 2. The seller delivers the agreed product, service, or milestone.
 3. The buyer confirms receipt and satisfaction.
 4. PakEscrow releases the funds to the seller.
-5. If a dispute arises, PakEscrow's moderation team adjudicates based on submitted evidence.
+5. If a dispute arises, TrustLink moderation team adjudicates based on submitted evidence.
 
 The platform is purpose-built for **freelancers**, **online marketplaces**, **social commerce sellers**, **B2B service agreements**, and **real estate/rental deposits**.
 
@@ -250,7 +250,7 @@ The platform is purpose-built for **freelancers**, **online marketplaces**, **so
 
 ## System Architecture
 
-PakEscrow follows a **modular monolith** architecture for the MVP phase, designed to decompose into microservices as transaction volume scales. The system is organized around clear domain boundaries with strict internal module contracts.
+TrustLink follows a **modular monolith** architecture for the MVP phase, designed to decompose into microservices as transaction volume scales. The system is organized around clear domain boundaries with strict internal module contracts.
 
 ### Architectural Overview
 
@@ -337,7 +337,7 @@ The notification module is event-driven. Domain services emit events (`EscrowFun
 
 ### Why PostgreSQL
 
-PostgreSQL was selected as the exclusive persistent store for PakEscrow based on its suitability for financial workloads:
+PostgreSQL was selected as the exclusive persistent store for TrustLink based on its suitability for financial workloads:
 
 - **ACID Transactions**: Every fund movement — deposit, escrow lock, release, refund — must be atomic. PostgreSQL's transaction semantics guarantee that a partial failure at any point rolls back the entire operation, preventing phantom credits or missing debits.
 - **Row-level locking**: `SELECT ... FOR UPDATE` allows pessimistic locking on wallet balance rows, preventing double-spend scenarios under concurrent requests.
@@ -362,7 +362,7 @@ PostgreSQL was selected as the exclusive persistent store for PakEscrow based on
 └──────┬──────┘       └─────────┬────────┘       └────────────────┘
        │                        │
        │              ┌─────────▼──────────────────────────────────┐
-       │              │         escrow_transactions                 │
+       │              │         TrustLink_transactions                 │
        │              │─────────────────────────────────────────── │
        │              │ id (UUID)                                   │
        │              │ reference_number (unique, indexed)          │
@@ -417,12 +417,12 @@ PostgreSQL was selected as the exclusive persistent store for PakEscrow based on
 
 ---
 
-## Escrow Workflow
+## TrustLink Workflow
 
 ### Transaction Lifecycle
 
 ```
-BUYER                        PAKESCROW                       SELLER
+BUYER                         TrustLink                         SELLER
   │                               │                               │
   │  1. Create Transaction        │                               │
   │──────────────────────────────▶│                               │
@@ -510,7 +510,7 @@ BUYER                        PAKESCROW                       SELLER
   └──────────┘     └──────────────┘
 ```
 
-### Milestone Escrow Flow
+### Milestone TrustLink Flow
 
 For phased agreements (e.g., a 3-milestone software project):
 
