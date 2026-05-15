@@ -50,13 +50,21 @@ TrustLink is a web-based marketplace that utilizes a "Locked-Funds" (Escrow) mod
 10. System Features / Functional Requirements:
     
 a.	Role-Based Access Control: Secure login for Clients and Freelancers.
+
 b.	Service Catalog: Searchable database of "Gigs" with pricing tiers.
+
 c.	Order Workflow: A multi-stage pipeline (Pending -> Active -> Delivered -> Completed).
+
 d.	Escrow Vault: A simulated wallet system that "locks" funds.
+
 e.	Evidence/Delivery Portal: Storing URLs to delivered work files.
+
 f.	Review Integrity System: Verified feedback linked to transaction IDs.
+
 i.	Dashboard Analytics: Freelancers can view pending vs. cleared earnings.
+
 j.	Internal Messaging: Record of communication for dispute resolution.
+
 
 10. Preliminary Data Design:
     
