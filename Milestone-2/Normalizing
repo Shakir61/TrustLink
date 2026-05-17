@@ -1,1 +1,254 @@
+# PakEscrow — Normalization Report (1NF → 2NF → 3NF)
+
+---
+
+## What Is Normalization?
+
+Normalization is the process of structuring a relational database to reduce **data redundancy** and prevent **update, insert, and delete anomalies**. It proceeds through progressive **Normal Forms (NF)**:
+
+| Normal Form | Core Rule |
+|---|---|
+| **1NF** | Every column holds a single, atomic value. No repeating groups or arrays of values in a cell. |
+| **2NF** | Every non-key column depends on the **whole** primary key (eliminates partial dependencies). Only relevant when the PK is composite. |
+| **3NF** | Every non-key column depends **only** on the primary key — not on another non-key column (eliminates transitive dependencies). |
+
+---
+
+## Summary of Changes
+
+| Change | Type | Tables Affected |
+|---|---|---|
+| Extracted `profile_data` JSONB → `user_profiles` | 1NF + 3NF | `users` → new `user_profiles` |
+| Extracted `terms` JSONB → `contract_terms` | 1NF + 3NF | `contracts` → new `contract_terms` |
+| Replaced `currency VARCHAR` → FK to `currencies` | 3NF | `wallets`, `contracts` |
+| Replaced `gateway ENUM` → FK to `payment_gateways` | 3NF | `payments` |
+| Added `dispute_evidence` for evidence files | 1NF | new `dispute_evidence` |
+| All original tables verified for 2NF | 2NF | All (single-col PKs — trivially satisfied) |
+
+---
+
+## Table-by-Table Justification
+
+---
+
+### 1. `users`
+
+**1NF:** All columns (`id`, `email`, `phone`, `role`, `kyc_tier`, `is_active`, `created_at`) are atomic and single-valued. ✅
+
+**2NF:** Primary key is a single column (`id`). Partial dependencies are impossible with a single-column PK. ✅
+
+**3NF (violation found → fixed):**
+The original schema stored `profile_data JSONB` directly on `users`. This blob contained structured fields — `bio`, `skills`, `portfolio_url`, `city` — that are not directly dependent on the user's identity (`id`). Instead, they describe a *profile*, which is a separate concept. This creates a transitive dependency:
+
+```
+id → profile_data → { bio, skills, portfolio_url, city }
+```
+
+**Fix:** Extracted to a new `user_profiles` table (one-to-one with `users`). Each profile attribute is now a typed, atomic column directly dependent on `user_id`.
+
+---
+
+### 2. `user_profiles` *(new)*
+
+**1NF:** All columns (`bio`, `skills` as TEXT[], `portfolio_url`, `city`, `country`) are atomic. ✅
+
+**2NF:** Single-column PK (`id`). ✅
+
+**3NF:** Every column describes the profile of this user directly. No non-key column determines another non-key column. ✅
+
+**Why it was added:** Removing the JSONB blob from `users` ensures that profile attributes are queryable, indexable, and type-safe — and that a change to one profile field does not require touching the `users` row.
+
+---
+
+### 3. `wallets`
+
+**1NF:** All columns atomic. `balance` and `locked_balance` are separate columns (not grouped). ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF (violation found → fixed):**
+The original `currency VARCHAR(10)` stored a currency code directly. If the platform ever needed to associate a display name or symbol with that currency, the value would need to be duplicated across every wallet row — an update anomaly. The transitive dependency was:
+
+```
+id → currency_code → currency_name, currency_symbol
+```
+
+**Fix:** `currency VARCHAR` replaced with `currency_code FK → currencies(code)`. Currency metadata lives in one place.
+
+---
+
+### 4. `currencies` *(new)*
+
+**1NF:** All columns (`code`, `name`, `symbol`, `is_active`) are atomic. ✅
+
+**2NF:** Single-column PK (`code`). ✅
+
+**3NF:** `name` and `symbol` directly describe the currency identified by `code`. No transitive dependencies. ✅
+
+**Why it was added:** Centralising currency metadata eliminates the need to hardcode currency labels anywhere else. Adding a new supported currency is a single INSERT, not a schema migration.
+
+---
+
+### 5. `kyc_documents`
+
+**1NF:** All columns atomic. Document type, S3 key, status, reviewer, and review timestamp are all separate, single-valued columns. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** `reviewed_by` and `reviewed_at` both describe the review event for **this specific document** — they depend directly on `id`, not on each other. No transitive dependency. ✅
+
+**No changes required.**
+
+---
+
+### 6. `contracts`
+
+**1NF:** The ERD showed `funded_at / completed_at / cancelled_at` grouped in one cell. Confirmed these are three **separate** atomic timestamp columns. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF (two violations found → fixed):**
+
+**Violation A — currency:**
+Same issue as `wallets`. `currency VARCHAR` created a transitive dependency via currency metadata.
+
+```
+id → currency_code → currency_name, symbol
+```
+
+**Fix:** Replaced with `currency_code FK → currencies(code)`.
+
+**Violation B — terms JSONB:**
+The `terms JSONB` blob stored structured data (file format requirements, revision policy, communication expectations, penalty rates). These fields are not directly dependent on `contract.id` — they describe a separate *terms* entity.
+
+```
+id → terms → { file_format_req, revision_policy, communication_notes, ... }
+```
+
+**Fix:** Extracted to `contract_terms` (one-to-one with `contracts`). Each term is now a typed, atomic column.
+
+---
+
+### 7. `contract_terms` *(new)*
+
+**1NF:** All columns atomic (`file_format_req`, `revision_policy`, `communication_notes`, `late_penalty_pct`, `additional_notes`). ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** Every column directly describes the terms for this contract. No non-key column depends on another non-key column. ✅
+
+**Why it was added:** Extracting terms allows the platform to query, filter, and validate specific term fields (e.g. "find all contracts with a late penalty > 5%") without parsing JSONB in application code.
+
+---
+
+### 8. `payments`
+
+**1NF:** All columns atomic. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF (violation found → fixed):**
+The original schema used `gateway payment_gateway ENUM`. ENUMs embed metadata (the human-readable gateway names) into the schema definition. Adding a new gateway or changing a display name requires an `ALTER TYPE` — a DDL operation. The transitive dependency:
+
+```
+id → gateway_code → display_name, is_active
+```
+
+**Fix:** `gateway ENUM` replaced with `gateway_code FK → payment_gateways(code)`. Gateway metadata is managed via DML, not DDL.
+
+---
+
+### 9. `payment_gateways` *(new)*
+
+**1NF:** All columns atomic (`code`, `display_name`, `is_active`). ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** `display_name` and `is_active` directly describe this gateway. No transitive dependencies. ✅
+
+**Why it was added:** New payment gateways can be added at runtime (INSERT) without a schema migration. Deactivating a gateway is a single UPDATE.
+
+---
+
+### 10. `milestones`
+
+**1NF:** `funded_at` and `released_at` are separate atomic columns. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** All non-key columns (`title`, `description`, `amount`, `sequence`, `status`, `due_date`, `funded_at`, `released_at`) directly and solely describe **this milestone**. No transitive dependencies. ✅
+
+**No changes required.**
+
+---
+
+### 11. `disputes`
+
+**1NF:** `resolved_at` and `created_at` are separate atomic columns. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** `resolution_type` and `resolution_note` directly describe the resolution of **this dispute**. `assigned_to` is a direct FK — it does not introduce any derived attributes. ✅
+
+**1NF violation found → fixed (new table):**
+The original schema had no place to store evidence files submitted during a dispute. In practice, these would have been stored as a JSONB array or comma-separated values inside `disputes`, violating 1NF (repeating groups). A dedicated `dispute_evidence` table was added.
+
+---
+
+### 12. `dispute_evidence` *(new)*
+
+**1NF:** Each evidence file is a separate row with atomic columns. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** All columns (`dispute_id`, `submitted_by`, `file_s3_key`, `description`, `submitted_at`) directly describe this piece of evidence. ✅
+
+**Why it was added:** Without this table, evidence would accumulate as a JSONB array in `disputes.resolution_note` or similar — an unqueryable, non-atomic structure. A dedicated table allows querying by submitter, filtering by dispute, and maintaining an audit trail of evidence submission.
+
+---
+
+### 13. `audit_logs`
+
+**1NF:** `ip_address` and `user_agent` are separate columns. `created_at` and `chain_hash` are separate columns. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** `before_snapshot` and `after_snapshot` are immutable JSONB point-in-time captures — they do not introduce transitive dependencies because they are historical records, not derived values. All columns depend directly on `id`. ✅
+
+**No changes required.**
+
+---
+
+### 14. `notifications`
+
+**1NF:** All columns atomic. ✅
+
+**2NF:** Single-column PK. ✅
+
+**3NF:** `payload JSONB` stores the rendered message (subject, body, dynamic values). This is a serialized delivery artifact whose internal structure varies per notification — it does not create transitive dependencies on `id` because no sub-field of `payload` is shared or reused across rows. ✅
+
+**No changes required.**
+
+---
+
+## Final Table Count
+
+| # | Table | Status |
+|---|---|---|
+| 1 | `users` | Modified (removed `profile_data`) |
+| 2 | `user_profiles` | **New** |
+| 3 | `wallets` | Modified (`currency` → FK) |
+| 4 | `currencies` | **New** |
+| 5 | `kyc_documents` | Unchanged |
+| 6 | `contracts` | Modified (`currency` → FK, removed `terms`) |
+| 7 | `contract_terms` | **New** |
+| 8 | `payment_gateways` | **New** |
+| 9 | `payments` | Modified (`gateway` → FK) |
+| 10 | `milestones` | Unchanged |
+| 11 | `disputes` | Unchanged |
+| 12 | `dispute_evidence` | **New** |
+| 13 | `audit_logs` | Unchanged |
+| 14 | `notifications` | Unchanged |
+
+**Original:** 9 tables → **Normalized:** 14 tables (5 new tables added)
 
