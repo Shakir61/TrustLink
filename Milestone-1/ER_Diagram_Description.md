@@ -1,7 +1,7 @@
-# PakEscrow — Database Structure Explained 🗂️
+# TrustLink — Database Structure Explained 🗂️
 
 > **Who is this document for?**
-> This guide is written for anyone who wants to understand how PakEscrow stores its data — without needing to know how to read a technical database diagram. No programming knowledge is required. Every table, every column, and every connection between them is explained in plain, everyday language.
+> This guide is written for anyone who wants to understand how TrustLink stores its data — without needing to know how to read a technical database diagram. No programming knowledge is required. Every table, every column, and every connection between them is explained in plain, everyday language.
 
 ---
 
@@ -168,7 +168,7 @@ Think of it as a **digital work order** that both parties have agreed to and tha
 | `title` | A short name for the project, e.g. "Logo Design for Al-Noor Foods". |
 | `scope` | A detailed description of exactly what work needs to be delivered. |
 | `total_amount` | The total money agreed upon for the entire contract, stored with 4 decimal places. |
-| `platform_fee` | The fee that PakEscrow charges for facilitating this contract. Calculated at the time of contract creation and stored here for transparency. |
+| `platform_fee` | The fee that TrustLink charges for facilitating this contract. Calculated at the time of contract creation and stored here for transparency. |
 | `currency` | The currency for this contract — defaults to `PKR`. |
 | `status` | Where this contract currently stands in its lifecycle. Possible values: `DRAFT`, `PENDING_ACCEPTANCE`, `FUNDED`, `IN_PROGRESS`, `DELIVERED`, `COMPLETED`, `DISPUTED`, `CANCELLED`, `REFUNDED`. |
 | `terms` | A flexible storage area for any additional agreed-upon terms — for example, file format requirements, communication expectations, or revision policies. |
@@ -269,7 +269,7 @@ Think of it as the platform's **conflict resolution record**.
 
 ### Why It Matters
 
-Without a dispute system, a disagreement between a client and a freelancer would have no resolution path — the money would just sit locked in escrow indefinitely. The dispute table ensures there is always a clear, documented path forward, with a neutral third party (PakEscrow's team) making the final call based on evidence submitted by both sides.
+Without a dispute system, a disagreement between a client and a freelancer would have no resolution path — the money would just sit locked in escrow indefinitely. The dispute table ensures there is always a clear, documented path forward, with a neutral third party (TrustLink team) making the final call based on evidence submitted by both sides.
 
 ---
 
@@ -277,7 +277,7 @@ Without a dispute system, a disagreement between a client and a freelancer would
 
 ### What It Is
 
-The `audit_logs` table is the **security black box** of PakEscrow. Every important action taken on the platform — whether by a user, a freelancer, a client, or an admin — is permanently recorded here. This table cannot be edited or deleted. Once an entry is written, it stays forever.
+The `audit_logs` table is the **security black box** of TrustLink. Every important action taken on the platform — whether by a user, a freelancer, a client, or an admin — is permanently recorded here. This table cannot be edited or deleted. Once an entry is written, it stays forever.
 
 Think of it like a CCTV recording of every action. If anything ever goes wrong — a disputed transaction, a fraud investigation, a legal inquiry — this table provides a complete, trustworthy record of exactly what happened and when.
 
@@ -467,11 +467,11 @@ At the end of this scenario, the database holds:
 | **NUMERIC(20,4)** | A way to store money values precisely, with up to 4 decimal places. This avoids the rounding errors that normal decimal storage can cause — critical for financial data. |
 | **TIMESTAMPTZ** | A date-and-time value that also records the timezone. Used for all date columns so records are always accurate regardless of where the server is located. |
 | **JSONB** | A flexible storage format for data that does not have a fixed structure. Like a notes field where you can store anything — used for contract terms, notification payloads, and profile data. |
-| **Escrow** | A financial arrangement where a neutral third party (PakEscrow) holds money on behalf of two parties until agreed conditions are met. |
+| **Escrow** | A financial arrangement where a neutral third party (TrustLink) holds money on behalf of two parties until agreed conditions are met. |
 | **KYC** | Know Your Customer — the process of verifying a user's real identity using official documents before allowing them to conduct financial transactions. |
 | **1:1 Relationship** | One record in Table A is linked to exactly one record in Table B, and vice versa. |
 | **1:N Relationship** | One record in Table A can be linked to many records in Table B. |
 
 ---
 
-*This document was written to accompany the PakEscrow Entity Relationship Diagram (`pakescrow_erd.xml`). For the technical database schema, refer to the main project README.*
+*This document was written to accompany the TrustLink Entity Relationship Diagram (`pakescrow_erd.xml`). For the technical database schema, refer to the main project README.*
