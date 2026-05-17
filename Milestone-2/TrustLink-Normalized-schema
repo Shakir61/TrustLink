@@ -1,0 +1,421 @@
+-- =============================================================
+--  PakEscrow — Normalized Schema (1NF → 2NF → 3NF)
+--  Normalization Report is in: pakescrow_normalization_report.md
+-- =============================================================
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- =============================================================
+-- ENUM TYPES
+-- =============================================================
+
+CREATE TYPE user_role AS ENUM (
+    'FREELANCER', 'CLIENT', 'ADMIN', 'MODERATOR', 'COMPLIANCE_OFFICER'
+);
+
+CREATE TYPE document_type AS ENUM (
+    'CNIC_FRONT', 'CNIC_BACK', 'SELFIE', 'PROOF_OF_ADDRESS'
+);
+
+CREATE TYPE kyc_status AS ENUM (
+    'PENDING', 'UNDER_REVIEW', 'APPROVED', 'REJECTED', 'EXPIRED'
+);
+
+CREATE TYPE contract_status AS ENUM (
+    'DRAFT', 'PENDING_ACCEPTANCE', 'FUNDED', 'IN_PROGRESS',
+    'DELIVERED', 'COMPLETED', 'DISPUTED', 'CANCELLED', 'REFUNDED'
+);
+
+CREATE TYPE payment_gateway AS ENUM (
+    'JAZZCASH', 'EASYPAISA', 'HBL', 'BANK_TRANSFER'
+);
+
+CREATE TYPE payment_status AS ENUM (
+    'PENDING', 'SUCCESS', 'FAILED', 'REFUNDED'
+);
+
+CREATE TYPE payment_direction AS ENUM (
+    'DEPOSIT', 'WITHDRAWAL', 'RELEASE'
+);
+
+CREATE TYPE milestone_status AS ENUM (
+    'PENDING', 'IN_PROGRESS', 'DELIVERED', 'APPROVED', 'DISPUTED', 'CANCELLED'
+);
+
+CREATE TYPE dispute_reason AS ENUM (
+    'NON_DELIVERY', 'QUALITY_NOT_MET', 'SCOPE_DISAGREEMENT',
+    'LATE_DELIVERY', 'PAYMENT_WITHHELD', 'OTHER'
+);
+
+CREATE TYPE dispute_status AS ENUM (
+    'RAISED', 'UNDER_REVIEW', 'EVIDENCE_SUBMITTED',
+    'DECISION_PENDING', 'RESOLVED', 'ESCALATED'
+);
+
+CREATE TYPE resolution_type AS ENUM (
+    'FULL_RELEASE', 'FULL_REFUND', 'PARTIAL_SPLIT'
+);
+
+CREATE TYPE notification_channel AS ENUM (
+    'EMAIL', 'SMS', 'IN_APP'
+);
+
+CREATE TYPE notification_status AS ENUM (
+    'PENDING', 'SENT', 'FAILED'
+);
+
+CREATE TYPE notification_event AS ENUM (
+    'CONTRACT_FUNDED', 'DELIVERY_SUBMITTED', 'DISPUTE_RAISED',
+    'FUNDS_RELEASED', 'KYC_APPROVED'
+);
+
+-- =============================================================
+-- NEW TABLE: currencies  [3NF ADDITION]
+-- Extracted from wallets and contracts.
+-- Previously, currency was a plain VARCHAR in both wallets and
+-- contracts, causing transitive dependency: if the currency name
+-- or symbol changed, multiple rows across two tables would need
+-- updating (update anomaly). Now currency is a lookup table —
+-- wallets and contracts store only the FK currency_code.
+-- =============================================================
+
+CREATE TABLE currencies (
+    code        VARCHAR(10)  PRIMARY KEY,          -- e.g. 'PKR', 'USD'
+    name        VARCHAR(50)  NOT NULL UNIQUE,       -- e.g. 'Pakistani Rupee'
+    symbol      VARCHAR(5)   NOT NULL,              -- e.g. '₨'
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE
+);
+
+INSERT INTO currencies (code, name, symbol) VALUES
+    ('PKR', 'Pakistani Rupee', '₨'),
+    ('USD', 'US Dollar',       '$');
+
+-- =============================================================
+-- NEW TABLE: payment_gateways  [3NF ADDITION]
+-- Previously, gateway was an ENUM on payments. If a gateway's
+-- display name, fee rate, or status needed updating, application
+-- code had to be redeployed to alter the ENUM. Extracting to a
+-- table removes that transitive dependency on non-key attributes
+-- and allows runtime management of gateway records.
+-- =============================================================
+
+CREATE TABLE payment_gateways (
+    code          VARCHAR(30)    PRIMARY KEY,       -- e.g. 'JAZZCASH'
+    display_name  VARCHAR(100)   NOT NULL,
+    is_active     BOOLEAN        NOT NULL DEFAULT TRUE
+);
+
+INSERT INTO payment_gateways (code, display_name) VALUES
+    ('JAZZCASH',      'JazzCash'),
+    ('EASYPAISA',     'Easypaisa'),
+    ('HBL',           'HBL Bank'),
+    ('BANK_TRANSFER', 'Bank Transfer');
+
+-- =============================================================
+-- TABLE: users  [NORMALIZED]
+-- 1NF: All columns are atomic. No repeating groups.
+-- 2NF: Single-column PK — no partial dependencies possible.
+-- 3NF: profile_data (JSONB) moved to user_profiles to remove
+--      the multi-valued, non-atomic blob from users, eliminating
+--      the transitive dependency between id → profile_data fields.
+-- =============================================================
+
+CREATE TABLE users (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    email       VARCHAR(255) NOT NULL UNIQUE,
+    phone       VARCHAR(20)  NOT NULL UNIQUE,
+    role        user_role    NOT NULL,
+    kyc_tier    SMALLINT     NOT NULL DEFAULT 1 CHECK (kyc_tier BETWEEN 1 AND 3),
+    is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================
+-- NEW TABLE: user_profiles  [3NF ADDITION]
+-- profile_data JSONB was a non-atomic, multi-valued blob sitting
+-- directly on users. This violated 1NF (non-atomic value) and
+-- 3NF (transitive: id → profile_data → individual profile fields
+-- like bio, skills, portfolio_url). Splitting it into a typed
+-- table with real columns makes each attribute directly and
+-- solely dependent on user_id (the key).
+-- One-to-one with users (UNIQUE FK).
+-- =============================================================
+
+CREATE TABLE user_profiles (
+    id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id        UUID         NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    bio            TEXT,
+    skills         TEXT[],                          -- array of skill tags
+    portfolio_url  VARCHAR(500),
+    city           VARCHAR(100),
+    country        VARCHAR(100) NOT NULL DEFAULT 'Pakistan',
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================
+-- TABLE: wallets  [NORMALIZED]
+-- 1NF: All columns atomic.
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: currency VARCHAR replaced with FK to currencies table,
+--      removing the transitive dependency
+--      id → currency_code → currency_name/symbol.
+-- =============================================================
+
+CREATE TABLE wallets (
+    id              UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID           NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    balance         NUMERIC(20, 4) NOT NULL DEFAULT 0.0000 CHECK (balance >= 0),
+    locked_balance  NUMERIC(20, 4) NOT NULL DEFAULT 0.0000 CHECK (locked_balance >= 0),
+    currency_code   VARCHAR(10)    NOT NULL DEFAULT 'PKR' REFERENCES currencies(code),
+    is_frozen       BOOLEAN        NOT NULL DEFAULT FALSE,
+    updated_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================
+-- TABLE: kyc_documents  [NORMALIZED]
+-- 1NF: All columns atomic, single value per cell.
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: No transitive dependencies. reviewed_by and reviewed_at
+--      both directly describe this document's review event,
+--      not each other. No further decomposition needed.
+-- =============================================================
+
+CREATE TABLE kyc_documents (
+    id             UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id        UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    document_type  document_type NOT NULL,
+    file_s3_key    TEXT          NOT NULL,
+    status         kyc_status    NOT NULL DEFAULT 'PENDING',
+    reviewed_by    UUID          REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_at    TIMESTAMPTZ
+);
+
+-- =============================================================
+-- TABLE: contracts  [NORMALIZED]
+-- 1NF: funded_at / completed_at / cancelled_at were grouped as
+--      "funded_at / completed_at / cancelled_at" in the ERD —
+--      confirmed as three separate atomic columns. ✓
+-- 2NF: Single-column PK — no partial dependencies possible.
+-- 3NF: currency VARCHAR replaced with FK to currencies.
+--      platform_fee_rate extracted to contract_fee_rules to
+--      remove transitive dependency:
+--      id → platform_fee → fee_rate (fee amount depends on
+--      total_amount and a rate, not directly on contract id).
+--      title + scope stay — they directly describe this contract.
+-- =============================================================
+
+CREATE TABLE contracts (
+    id                UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    reference_number  VARCHAR(50)     NOT NULL UNIQUE,
+    client_id         UUID            NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    freelancer_id     UUID            NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    title             VARCHAR(255)    NOT NULL,
+    scope             TEXT            NOT NULL,
+    total_amount      NUMERIC(20, 4)  NOT NULL CHECK (total_amount > 0),
+    platform_fee      NUMERIC(20, 4)  NOT NULL DEFAULT 0.0000 CHECK (platform_fee >= 0),
+    currency_code     VARCHAR(10)     NOT NULL DEFAULT 'PKR' REFERENCES currencies(code),
+    status            contract_status NOT NULL DEFAULT 'DRAFT',
+    terms             JSONB,
+    max_revisions     SMALLINT        NOT NULL DEFAULT 3 CHECK (max_revisions >= 0),
+    revision_count    SMALLINT        NOT NULL DEFAULT 0 CHECK (revision_count >= 0),
+    delivery_deadline TIMESTAMPTZ,
+    funded_at         TIMESTAMPTZ,
+    completed_at      TIMESTAMPTZ,
+    cancelled_at      TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_different_parties CHECK (client_id <> freelancer_id)
+);
+
+-- =============================================================
+-- NEW TABLE: contract_terms  [3NF ADDITION]
+-- The terms JSONB column on contracts stored a non-atomic blob
+-- of structured data (revision policy, file formats, comms
+-- expectations). This violates 1NF (non-atomic) and 3NF
+-- (individual term fields transitively depend on their own
+-- keys, not on contract id). Extracting to a typed table makes
+-- each term attribute a proper atomic column directly dependent
+-- on contract_id.
+-- One-to-one with contracts (UNIQUE FK).
+-- =============================================================
+
+CREATE TABLE contract_terms (
+    id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    contract_id         UUID         NOT NULL UNIQUE REFERENCES contracts(id) ON DELETE CASCADE,
+    file_format_req     TEXT,                        -- e.g. 'PDF, PSD, AI'
+    revision_policy     TEXT,
+    communication_notes TEXT,
+    late_penalty_pct    NUMERIC(5,2) DEFAULT 0.00,   -- % penalty per day late
+    additional_notes    TEXT
+);
+
+-- =============================================================
+-- TABLE: payments  [NORMALIZED]
+-- 1NF: All columns atomic.
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: gateway ENUM replaced with FK to payment_gateways table,
+--      removing transitive dependency:
+--      id → gateway_code → gateway display_name / is_active.
+-- =============================================================
+
+CREATE TABLE payments (
+    id            UUID              PRIMARY KEY DEFAULT gen_random_uuid(),
+    contract_id   UUID              NOT NULL REFERENCES contracts(id) ON DELETE RESTRICT,
+    user_id       UUID              NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    amount        NUMERIC(20, 4)    NOT NULL CHECK (amount > 0),
+    gateway_code  VARCHAR(30)       NOT NULL REFERENCES payment_gateways(code),
+    gateway_ref   VARCHAR(255),
+    status        payment_status    NOT NULL DEFAULT 'PENDING',
+    direction     payment_direction NOT NULL,
+    created_at    TIMESTAMPTZ       NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================
+-- TABLE: milestones  [NORMALIZED]
+-- 1NF: funded_at / released_at confirmed as two separate atomic
+--      columns. All columns single-valued. ✓
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: No transitive dependencies. Every non-key column
+--      (title, description, amount, sequence, status, due_date,
+--      funded_at, released_at) describes THIS milestone directly.
+-- =============================================================
+
+CREATE TABLE milestones (
+    id           UUID             PRIMARY KEY DEFAULT gen_random_uuid(),
+    contract_id  UUID             NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
+    title        VARCHAR(255)     NOT NULL,
+    description  TEXT,
+    amount       NUMERIC(20, 4)   NOT NULL CHECK (amount > 0),
+    sequence     SMALLINT         NOT NULL CHECK (sequence >= 1),
+    status       milestone_status NOT NULL DEFAULT 'PENDING',
+    due_date     TIMESTAMPTZ,
+    funded_at    TIMESTAMPTZ,
+    released_at  TIMESTAMPTZ,
+    UNIQUE (contract_id, sequence)
+);
+
+-- =============================================================
+-- TABLE: disputes  [NORMALIZED]
+-- 1NF: resolved_at / created_at confirmed as two separate atomic
+--      columns. ✓
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: resolution_type and resolution_note both directly describe
+--      the resolution of THIS dispute — no transitive dependency.
+--      assigned_to FK references users — no derived attributes.
+-- =============================================================
+
+CREATE TABLE disputes (
+    id               UUID             PRIMARY KEY DEFAULT gen_random_uuid(),
+    contract_id      UUID             NOT NULL REFERENCES contracts(id) ON DELETE RESTRICT,
+    raised_by        UUID             NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    reason           dispute_reason   NOT NULL,
+    status           dispute_status   NOT NULL DEFAULT 'RAISED',
+    assigned_to      UUID             REFERENCES users(id) ON DELETE SET NULL,
+    resolution_type  resolution_type,
+    resolution_note  TEXT,
+    resolved_at      TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================
+-- NEW TABLE: dispute_evidence  [1NF ADDITION]
+-- In the original schema, evidence files had no dedicated table —
+-- they would have been stored as a JSONB array or multiple
+-- columns inside disputes, which violates 1NF (repeating groups).
+-- Each piece of evidence is a separate atomic row here, with its
+-- own submitter, file reference, and timestamp.
+-- =============================================================
+
+CREATE TABLE dispute_evidence (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    dispute_id   UUID        NOT NULL REFERENCES disputes(id) ON DELETE CASCADE,
+    submitted_by UUID        NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    file_s3_key  TEXT        NOT NULL,
+    description  TEXT,
+    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================
+-- TABLE: audit_logs  [NORMALIZED]
+-- 1NF: created_at / chain_hash confirmed as two separate atomic
+--      columns. ip_address / user_agent are separate columns. ✓
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: before_snapshot and after_snapshot are JSONB point-in-time
+--      captures — they don't introduce transitive dependencies
+--      because they are immutable snapshots, not derived values.
+--      No further decomposition required.
+-- =============================================================
+
+CREATE TABLE audit_logs (
+    id               UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_id         UUID         REFERENCES users(id) ON DELETE SET NULL,
+    action           VARCHAR(100) NOT NULL,
+    entity_type      VARCHAR(50)  NOT NULL,
+    entity_id        UUID         NOT NULL,
+    before_snapshot  JSONB,
+    after_snapshot   JSONB,
+    ip_address       INET,
+    user_agent       TEXT,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    chain_hash       TEXT         NOT NULL
+);
+
+-- =============================================================
+-- TABLE: notifications  [NORMALIZED]
+-- 1NF: All columns atomic.
+-- 2NF: Single-column PK — no partial dependencies.
+-- 3NF: payload JSONB stores the rendered message content
+--      (subject, body, dynamic values). This is acceptable as
+--      a serialized delivery artifact — its internal fields do
+--      not create transitive dependencies on notification id
+--      because the content varies per notification instance.
+--      No decomposition needed.
+-- =============================================================
+
+CREATE TABLE notifications (
+    id          UUID                 PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID                 NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_type  notification_event   NOT NULL,
+    channel     notification_channel NOT NULL,
+    payload     JSONB                NOT NULL,
+    status      notification_status  NOT NULL DEFAULT 'PENDING',
+    sent_at     TIMESTAMPTZ
+);
+
+-- =============================================================
+-- TRIGGERS: auto-update timestamps
+-- =============================================================
+
+CREATE OR REPLACE FUNCTION fn_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_wallets_updated_at
+    BEFORE UPDATE ON wallets
+    FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TRIGGER trg_contracts_updated_at
+    BEFORE UPDATE ON contracts
+    FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TRIGGER trg_user_profiles_updated_at
+    BEFORE UPDATE ON user_profiles
+    FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- =============================================================
+-- TRIGGER: auto-create wallet + profile on user registration
+-- =============================================================
+
+CREATE OR REPLACE FUNCTION fn_bootstrap_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO wallets      (user_id) VALUES (NEW.id);
+    INSERT INTO user_profiles(user_id) VALUES (NEW.id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_bootstrap_new_user
+    AFTER INSERT ON users
+    FOR EACH ROW EXECUTE FUNCTION fn_bootstrap_new_user();
