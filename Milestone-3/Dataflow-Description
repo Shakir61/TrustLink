@@ -1,1 +1,1106 @@
+# PakEscrow — Data Flow Documentation
 
+> **Purpose:** This document explains where data enters the PakEscrow system, how it travels through each database table, which tables depend on which, and what outputs the system produces at every stage. It is written for developers, database engineers, product managers, and technical reviewers who need to understand the complete lifecycle of data — from a user's first registration to the final fund release and audit trail.
+
+---
+
+## Table of Contents
+
+- [1. Data Flow Overview](#1-data-flow-overview)
+- [2. Entry Points — Where Data Enters the System](#2-entry-points--where-data-enters-the-system)
+- [3. Flow 1 — User Registration & Identity](#3-flow-1--user-registration--identity)
+- [4. Flow 2 — KYC Verification](#4-flow-2--kyc-verification)
+- [5. Flow 3 — Contract Creation & Acceptance](#5-flow-3--contract-creation--acceptance)
+- [6. Flow 4 — Escrow Funding (Payment In)](#6-flow-4--escrow-funding-payment-in)
+- [7. Flow 5 — Milestone Management](#7-flow-5--milestone-management)
+- [8. Flow 6 — Delivery, Approval & Fund Release](#8-flow-6--delivery-approval--fund-release)
+- [9. Flow 7 — Dispute Resolution](#9-flow-7--dispute-resolution)
+- [10. Flow 8 — Withdrawal (Payment Out)](#10-flow-8--withdrawal-payment-out)
+- [11. Cross-Cutting Flows — Audit & Notifications](#11-cross-cutting-flows--audit--notifications)
+- [12. Table Dependency Map](#12-table-dependency-map)
+- [13. Data Outputs — What the System Produces](#13-data-outputs--what-the-system-produces)
+- [14. End-to-End Data Flow Summary](#14-end-to-end-data-flow-summary)
+
+---
+
+## 1. Data Flow Overview
+
+PakEscrow's data layer is organized around a **hub-and-spoke dependency model**. The `users` table is the central hub — every other table in the system has at least one foreign key pointing back to it. The `contracts` table is a secondary hub — `payments`, `milestones`, and `disputes` all depend on it.
+
+Data moves through the system in **eight distinct flows**, each triggered by a real-world event (a user signing up, a client depositing funds, a freelancer submitting work, etc.). Each flow writes to one or more tables, reads from dependent tables to validate integrity, and produces outputs in the form of updated balances, status changes, notifications, and audit entries.
+
+```
+ EXTERNAL WORLD                     PAKESCROW DATABASE
+ ─────────────                      ─────────────────────────────────────────────────
+ User fills form  ──WRITE──▶  [ users ]  ──▶  [ wallets ]
+                                  │
+                  ──WRITE──▶  [ kyc_documents ]
+                                  │
+ Client creates   ──WRITE──▶  [ contracts ]  ──▶  [ milestones ]
+ contract                         │
+                                  ├──▶  [ payments ]
+                                  │
+                                  ├──▶  [ disputes ]
+                                  │
+ Every action     ──WRITE──▶  [ audit_logs ]
+                  ──WRITE──▶  [ notifications ]
+                                  │
+ Dashboard /      ◀──READ───  All tables
+ Reports / APIs
+```
+
+---
+
+## 2. Entry Points — Where Data Enters the System
+
+Data enters PakEscrow through **four primary entry points**:
+
+| # | Entry Point | Who Sends It | Data Sent |
+|---|---|---|---|
+| 1 | **Registration Form** | Freelancer or Client | Name, email, phone, role, password |
+| 2 | **KYC Upload Portal** | Registered user | CNIC images, selfie, proof of address |
+| 3 | **Contract Creation Form** | Client | Project title, scope, amount, deadline, terms |
+| 4 | **Payment Gateway Webhook** | JazzCash / EasyPaisa / HBL | Payment confirmation, gateway reference, amount |
+
+Additionally, two **system-internal entry points** generate data automatically:
+
+| # | Internal Source | What It Writes |
+|---|---|---|
+| 5 | **Application Event Bus** | Audit log entries on every state change |
+| 6 | **Notification Worker (BullMQ)** | Notification records dispatched to email/SMS/in-app |
+
+---
+
+## 3. Flow 1 — User Registration & Identity
+
+**Trigger:** A freelancer or client submits the registration form.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — Form submission arrives at POST /api/v1/auth/register
+         │
+         ▼
+Step 2 — Input validated (email format, phone format, password strength)
+         │
+         ▼
+Step 3 — WRITE to [ users ]
+         │  New row created with:
+         │  • id          = system-generated UUID
+         │  • email       = from form
+         │  • phone       = from form (Pakistani format +923XXXXXXXXX)
+         │  • role        = FREELANCER or CLIENT
+         │  • kyc_tier    = 1 (default — phone+email only)
+         │  • is_active   = TRUE
+         │  • profile_data = JSON (name, city, skills if freelancer)
+         │  • created_at  = current timestamp
+         │
+         ▼
+Step 4 — WRITE to [ wallets ]   ← depends on users.id
+         │  One wallet auto-created per user:
+         │  • user_id         = users.id (FK)
+         │  • balance         = 0.0000
+         │  • locked_balance  = 0.0000
+         │  • currency        = PKR
+         │  • is_frozen       = FALSE
+         │
+         ▼
+Step 5 — WRITE to [ audit_logs ]  ← triggered automatically
+         │  Action: USER_REGISTERED
+         │  actor_id = new users.id
+         │  entity_type = 'user'
+         │  before_snapshot = {}
+         │  after_snapshot  = {email, role}
+         │
+         ▼
+Step 6 — WRITE to [ notifications ]
+         │  Event: WELCOME_EMAIL
+         │  Channel: EMAIL + SMS
+         │  Payload: Welcome message with OTP verification link
+         │
+         ▼
+Step 7 — OUTPUT: JWT access token + refresh token returned to client
+```
+
+### Tables Written
+
+| Table | Operation | Data Written |
+|---|---|---|
+| `users` | INSERT | Complete user profile row |
+| `wallets` | INSERT | Zero-balance wallet linked to new user |
+| `audit_logs` | INSERT | USER_REGISTERED event |
+| `notifications` | INSERT | Welcome + OTP verification message |
+
+### Tables Read (Validation)
+
+| Table | Purpose |
+|---|---|
+| `users` | Check email uniqueness before insert |
+| `users` | Check phone uniqueness before insert |
+
+### Dependencies
+
+```
+users           ← no dependencies (root table, created first)
+wallets         ← depends on users.id (must exist before wallet is created)
+audit_logs      ← depends on users.id (actor_id FK)
+notifications   ← depends on users.id (user_id FK)
+```
+
+---
+
+## 4. Flow 2 — KYC Verification
+
+**Trigger:** A registered user submits identity documents to unlock higher transaction limits.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — User uploads CNIC front, CNIC back, and selfie
+         via POST /api/v1/kyc/submit (multipart form)
+         │
+         ▼
+Step 2 — Files uploaded to AWS S3 (private bucket)
+         │  Each file stored at: kyc/{user_id}/{doc_type}_{uuid}.jpg
+         │  S3 key returned to application
+         │
+         ▼
+Step 3 — WRITE to [ kyc_documents ]  ← depends on users.id
+         │  One row per document uploaded:
+         │  • user_id       = submitting user's UUID (FK → users)
+         │  • document_type = CNIC_FRONT | CNIC_BACK | SELFIE | PROOF_OF_ADDRESS
+         │  • file_s3_key   = S3 storage path (not the file itself)
+         │  • status        = PENDING
+         │  • reviewed_by   = NULL (not yet reviewed)
+         │  • reviewed_at   = NULL
+         │
+         ▼
+Step 4 — WRITE to [ audit_logs ]
+         │  Action: KYC_SUBMITTED
+         │  actor_id = submitting user
+         │
+         ▼
+Step 5 — WRITE to [ notifications ]
+         │  Event: KYC_SUBMITTED_CONFIRMATION
+         │  Channel: EMAIL
+         │
+         ▼
+Step 6 — Admin opens KYC review queue in dashboard
+         READ from [ kyc_documents ] WHERE status = 'PENDING'
+         READ from [ users ] to fetch submitter profile
+         │
+         ▼
+Step 7 — Admin approves or rejects
+         │
+         ▼
+Step 8 — UPDATE [ kyc_documents ]
+         │  • status      = APPROVED | REJECTED
+         │  • reviewed_by = admin's users.id (FK → users)
+         │  • reviewed_at = current timestamp
+         │
+         ▼
+Step 9 — UPDATE [ users ]
+         │  • kyc_tier = 2 or 3 (based on documents approved)
+         │
+         ▼
+Step 10 — WRITE to [ audit_logs ]
+          Action: KYC_APPROVED or KYC_REJECTED
+          actor_id = admin user
+          before_snapshot = {status: 'PENDING'}
+          after_snapshot  = {status: 'APPROVED', reviewed_by: admin_id}
+          │
+          ▼
+Step 11 — WRITE to [ notifications ]
+          Event: KYC_APPROVED or KYC_REJECTED
+          Channel: EMAIL + SMS
+          │
+          ▼
+Step 12 — OUTPUT: User's transaction limit unlocked (reflected in users.kyc_tier)
+```
+
+### Tables Written
+
+| Table | Operation | Trigger |
+|---|---|---|
+| `kyc_documents` | INSERT | User submits documents |
+| `kyc_documents` | UPDATE | Admin reviews and decides |
+| `users` | UPDATE | kyc_tier upgraded after approval |
+| `audit_logs` | INSERT | On submit and on review decision |
+| `notifications` | INSERT | On submit confirmation and review result |
+
+### Dependencies
+
+```
+kyc_documents   ← depends on users.id (user_id FK)
+kyc_documents   ← depends on users.id (reviewed_by FK — admin)
+audit_logs      ← depends on users.id (actor_id FK)
+notifications   ← depends on users.id (user_id FK)
+```
+
+---
+
+## 5. Flow 3 — Contract Creation & Acceptance
+
+**Trigger:** A client creates an escrow contract and a freelancer accepts it.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — Client fills contract form: title, scope, amount, deadline, terms
+         POST /api/v1/escrow
+         │
+         ▼
+Step 2 — System validates:
+         READ [ users ] to confirm client's kyc_tier allows contract amount
+         READ [ users ] to confirm freelancer_id exists
+         READ [ wallets ] to confirm client has sufficient balance (not required
+         at creation — payment comes later, but limit checks apply)
+         │
+         ▼
+Step 3 — WRITE to [ contracts ]
+         │  • id                = new UUID
+         │  • reference_number  = PKE-2024-XXXXX (sequential, unique)
+         │  • client_id         = requesting user's UUID (FK → users)
+         │  • freelancer_id     = invited freelancer's UUID (FK → users)
+         │  • title             = from form
+         │  • scope             = from form
+         │  • total_amount      = from form (NUMERIC 20,4)
+         │  • platform_fee      = total_amount × 1.5% (calculated at creation)
+         │  • currency          = PKR
+         │  • status            = DRAFT
+         │  • terms             = JSONB (file formats, revision policy, etc.)
+         │  • max_revisions     = from form (default 3)
+         │  • revision_count    = 0
+         │  • delivery_deadline = from form
+         │  • created_at        = now()
+         │
+         ▼
+Step 4 — WRITE to [ milestones ]  ← if milestone-based contract
+         │  One row per milestone:
+         │  • contract_id = contracts.id (FK)
+         │  • title, description, amount, sequence, due_date
+         │  • status = PENDING
+         │
+         ▼
+Step 5 — WRITE to [ notifications ]
+         │  Event: CONTRACT_INVITATION
+         │  Recipient: freelancer
+         │  Channel: EMAIL + SMS
+         │  Payload: Contract title, amount, deadline, accept link
+         │
+         ▼
+Step 6 — WRITE to [ audit_logs ]
+         │  Action: CONTRACT_CREATED
+         │  actor_id = client user
+         │
+         ▼
+Step 7 — Freelancer reviews and accepts
+         POST /api/v1/escrow/:id/accept
+         │
+         ▼
+Step 8 — UPDATE [ contracts ]
+         │  • status = PENDING_ACCEPTANCE → accepted state
+         │  • updated_at = now()
+         │
+         ▼
+Step 9 — WRITE to [ notifications ]
+         │  Event: CONTRACT_ACCEPTED
+         │  Recipient: client
+         │  Channel: EMAIL + IN_APP
+         │
+         ▼
+Step 10 — WRITE to [ audit_logs ]
+          Action: CONTRACT_ACCEPTED
+          actor_id = freelancer user
+          │
+          ▼
+Step 11 — OUTPUT: Contract visible on both dashboards
+          Status: PENDING_ACCEPTANCE (awaiting client payment)
+```
+
+### Tables Written
+
+| Table | Operation | Trigger |
+|---|---|---|
+| `contracts` | INSERT | Client submits contract form |
+| `contracts` | UPDATE | Freelancer accepts |
+| `milestones` | INSERT | If milestone-based — one row per phase |
+| `audit_logs` | INSERT | On creation and on acceptance |
+| `notifications` | INSERT | Invitation to freelancer; confirmation to client |
+
+### Dependencies
+
+```
+contracts     ← depends on users.id × 2 (client_id FK, freelancer_id FK)
+milestones    ← depends on contracts.id (contract_id FK)
+audit_logs    ← depends on users.id (actor_id FK)
+notifications ← depends on users.id (user_id FK)
+```
+
+---
+
+## 6. Flow 4 — Escrow Funding (Payment In)
+
+**Trigger:** Client deposits the contract amount via a payment gateway.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — Client selects payment gateway (JazzCash / EasyPaisa / HBL / Bank)
+         POST /api/v1/escrow/:id/fund
+         │
+         ▼
+Step 2 — Platform redirects client to gateway payment page
+         No database write yet — payment is pending
+         │
+         ▼
+Step 3 — Client completes payment on gateway
+         Gateway sends HMAC-signed webhook to:
+         POST /api/v1/webhooks/jazzcash  (or easypaisa / hbl)
+         │
+         ▼
+Step 4 — HMAC signature validated (webhook rejected if invalid)
+         │
+         ▼
+Step 5 — WRITE to [ payments ]  ← depends on contracts.id and users.id
+         │  • id           = new UUID
+         │  • contract_id  = contracts.id (FK)
+         │  • user_id      = client's users.id (FK)
+         │  • amount       = contract total_amount (NUMERIC 20,4)
+         │  • gateway      = JAZZCASH | EASYPAISA | HBL | BANK_TRANSFER
+         │  • gateway_ref  = gateway's own transaction reference
+         │  • status       = SUCCESS
+         │  • direction    = DEPOSIT
+         │  • created_at   = now()
+         │
+         ▼
+Step 6 — UPDATE [ wallets ] — client wallet  ← within same DB transaction
+         │  BEGIN TRANSACTION
+         │  SELECT ... FOR UPDATE ON wallets WHERE user_id = client_id
+         │  (pessimistic row-level lock — prevents double-spend)
+         │  • locked_balance = locked_balance + contract.total_amount
+         │  • updated_at    = now()
+         │  COMMIT
+         │
+         ▼
+Step 7 — UPDATE [ contracts ]
+         │  • status    = FUNDED
+         │  • funded_at = now()
+         │  • updated_at = now()
+         │
+         ▼
+Step 8 — UPDATE [ milestones ] (if milestone contract)
+         │  First milestone: status = IN_PROGRESS, funded_at = now()
+         │
+         ▼
+Step 9 — WRITE to [ audit_logs ]
+         │  Action: CONTRACT_FUNDED
+         │  actor_id = client
+         │  before_snapshot = {status: 'PENDING_ACCEPTANCE'}
+         │  after_snapshot  = {status: 'FUNDED', amount: X}
+         │
+         ▼
+Step 10 — WRITE to [ notifications ]
+          │  Event: CONTRACT_FUNDED
+          │  Recipient 1: freelancer — "Funds secured. You may begin work."
+          │  Recipient 2: client    — "Your payment has been locked in escrow."
+          │  Channel: EMAIL + SMS
+          │
+          ▼
+Step 11 — OUTPUT:
+          • contracts.status = FUNDED
+          • wallets.locked_balance increased by contract amount
+          • Freelancer receives green light to begin work
+```
+
+### Tables Written
+
+| Table | Operation | Trigger |
+|---|---|---|
+| `payments` | INSERT | Webhook confirms successful gateway payment |
+| `wallets` | UPDATE | locked_balance increased (within DB transaction) |
+| `contracts` | UPDATE | status → FUNDED, funded_at recorded |
+| `milestones` | UPDATE | First milestone status → IN_PROGRESS |
+| `audit_logs` | INSERT | CONTRACT_FUNDED event |
+| `notifications` | INSERT | Both parties notified |
+
+### Database Transaction Guarantee
+
+```
+BEGIN;
+  -- Lock client wallet row
+  SELECT * FROM wallets WHERE user_id = $client_id FOR UPDATE;
+
+  -- Record payment
+  INSERT INTO payments (...) VALUES (...);
+
+  -- Lock funds
+  UPDATE wallets SET locked_balance = locked_balance + $amount
+  WHERE user_id = $client_id;
+
+  -- Advance contract state
+  UPDATE contracts SET status = 'FUNDED', funded_at = NOW()
+  WHERE id = $contract_id;
+
+COMMIT;
+-- If any step fails → entire block rolls back. No partial state.
+```
+
+### Dependencies
+
+```
+payments    ← depends on contracts.id (contract_id FK)
+payments    ← depends on users.id    (user_id FK)
+wallets     ← depends on users.id    (user_id FK)
+audit_logs  ← depends on users.id    (actor_id FK)
+```
+
+---
+
+## 7. Flow 5 — Milestone Management
+
+**Trigger:** Freelancer completes a phase of work and delivers a milestone.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — Freelancer submits milestone delivery
+         POST /api/v1/escrow/:id/milestones/:milestoneId/deliver
+         Body: { description, file_attachments[], external_links[] }
+         │
+         ▼
+Step 2 — READ [ contracts ] to confirm status = IN_PROGRESS or FUNDED
+         READ [ milestones ] to confirm milestone status = IN_PROGRESS
+         READ [ users ] to confirm requester is the contract's freelancer
+         │
+         ▼
+Step 3 — Delivery files uploaded to AWS S3
+         S3 keys stored in milestone metadata
+         │
+         ▼
+Step 4 — UPDATE [ milestones ]
+         │  • status     = DELIVERED
+         │  • updated_at = now()
+         │
+         ▼
+Step 5 — UPDATE [ contracts ]
+         │  • status     = DELIVERED (if final milestone)
+         │  • updated_at = now()
+         │
+         ▼
+Step 6 — WRITE to [ audit_logs ]
+         │  Action: MILESTONE_DELIVERED
+         │  actor_id = freelancer
+         │
+         ▼
+Step 7 — WRITE to [ notifications ]
+         │  Event: DELIVERY_SUBMITTED
+         │  Recipient: client
+         │  Channel: EMAIL + SMS + IN_APP
+         │  Payload: "Review delivery within 3 days."
+         │
+         ▼
+Step 8 — Client reviews and APPROVES milestone
+         POST /api/v1/escrow/:id/milestones/:milestoneId/approve
+         │
+         ▼
+Step 9 — READ [ wallets ] WHERE user_id = freelancer_id FOR UPDATE
+         (lock freelancer wallet before credit)
+         │
+         ▼
+Step 10 — UPDATE [ wallets ] — client wallet
+          │  • locked_balance = locked_balance - milestone.amount
+          │
+          ▼
+Step 11 — UPDATE [ wallets ] — freelancer wallet
+          │  • balance = balance + (milestone.amount - proportional_fee)
+          │
+          ▼
+Step 12 — UPDATE [ milestones ]
+          │  • status      = APPROVED
+          │  • released_at = now()
+          │
+          ▼
+Step 13 — WRITE to [ payments ]
+          │  • direction = RELEASE
+          │  • amount    = milestone.amount - fee
+          │  • user_id   = freelancer's UUID
+          │
+          ▼
+Step 14 — UPDATE [ contracts ]
+          │  If all milestones APPROVED: status = COMPLETED, completed_at = now()
+          │  Otherwise: status remains IN_PROGRESS, next milestone activated
+          │
+          ▼
+Step 15 — WRITE to [ audit_logs ]
+          │  Action: MILESTONE_APPROVED
+          │
+          ▼
+Step 16 — WRITE to [ notifications ]
+          │  Event: MILESTONE_APPROVED
+          │  Recipient: freelancer
+          │  Channel: EMAIL + IN_APP
+          │
+          ▼
+Step 17 — OUTPUT: Freelancer wallet balance increased
+          Next milestone unlocked (if applicable)
+          Contract completed (if final milestone)
+```
+
+### Revision Request Sub-Flow
+
+```
+Client rejects milestone → WRITE to [ contracts ]: revision_count + 1
+If revision_count < max_revisions:
+    UPDATE [ milestones ]: status = IN_PROGRESS (returned to freelancer)
+    WRITE  [ notifications ]: REVISION_REQUESTED → freelancer
+    WRITE  [ audit_logs ]: REVISION_REQUESTED
+If revision_count >= max_revisions:
+    Client offered option to raise a DISPUTE (→ Flow 7)
+```
+
+### Tables Written (Milestone Flow)
+
+| Table | Operation | Trigger |
+|---|---|---|
+| `milestones` | UPDATE | Status: IN_PROGRESS → DELIVERED → APPROVED |
+| `contracts` | UPDATE | Status advances; completed_at set if last milestone |
+| `wallets` | UPDATE × 2 | Client locked_balance ↓ ; Freelancer balance ↑ |
+| `payments` | INSERT | RELEASE direction record |
+| `audit_logs` | INSERT | Per state transition |
+| `notifications` | INSERT | Delivery alert + approval confirmation |
+
+---
+
+## 8. Flow 6 — Delivery, Approval & Fund Release
+
+**Trigger:** Single-payment contract delivered and approved by client.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — Freelancer submits final delivery
+         POST /api/v1/escrow/:id/deliver
+         │
+         ▼
+Step 2 — UPDATE [ contracts ]
+         │  • status = DELIVERED
+         │
+         ▼
+Step 3 — WRITE to [ notifications ]
+         │  Event: DELIVERY_SUBMITTED → client
+         │  "Review within 3 days. Auto-escalation if no action."
+         │
+         ▼
+Step 4 — CLIENT APPROVES delivery
+         POST /api/v1/escrow/:id/approve
+         │
+         ▼
+Step 5 — BEGIN TRANSACTION (atomic fund release)
+         │
+         ├─ Step 5a — READ [ wallets ] client row   FOR UPDATE (lock)
+         ├─ Step 5b — READ [ wallets ] freelancer row FOR UPDATE (lock)
+         ├─ Step 5c — READ [ contracts ] to verify status = DELIVERED
+         │
+         ├─ Step 5d — UPDATE [ wallets ] client
+         │              locked_balance = locked_balance - total_amount
+         │
+         ├─ Step 5e — UPDATE [ wallets ] freelancer
+         │              balance = balance + (total_amount - platform_fee)
+         │
+         ├─ Step 5f — WRITE to [ payments ]
+         │              direction = RELEASE
+         │              amount    = total_amount - platform_fee
+         │              user_id   = freelancer UUID
+         │              status    = SUCCESS
+         │
+         └─ Step 5g — UPDATE [ contracts ]
+                        status       = COMPLETED
+                        completed_at = now()
+         │
+         COMMIT
+         │
+         ▼
+Step 6 — WRITE to [ audit_logs ]
+         │  Action: CONTRACT_APPROVED + FUNDS_RELEASED
+         │  Two log entries written sequentially with chain hashes
+         │
+         ▼
+Step 7 — WRITE to [ notifications ]
+         │  Recipient 1: client    — "Contract completed. Thank you."
+         │  Recipient 2: freelancer — "PKR X released to your wallet."
+         │  Channel: EMAIL + SMS + IN_APP
+         │
+         ▼
+Step 8 — OUTPUT:
+         • contracts.status = COMPLETED
+         • Freelancer wallet balance = previous + net_amount
+         • Client locked_balance = 0 for this contract
+         • Platform fee retained in system escrow wallet
+         • Both users can download transaction receipt
+```
+
+### Fund Flow Diagram
+
+```
+BEFORE APPROVAL:
+  Client Wallet:     balance=50,000  locked_balance=30,000
+  Freelancer Wallet: balance=5,000   locked_balance=0
+  System Escrow:     holds 30,000
+
+AFTER APPROVAL (contract amount = 30,000 | platform_fee = 450):
+  Client Wallet:     balance=50,000  locked_balance=0
+  Freelancer Wallet: balance=34,550  locked_balance=0  (+29,550 net)
+  Platform Revenue:  +450 (fee retained)
+```
+
+---
+
+## 9. Flow 7 — Dispute Resolution
+
+**Trigger:** Client or freelancer raises a formal dispute on an active contract.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — User raises dispute
+         POST /api/v1/disputes
+         Body: { contract_id, reason, description }
+         │
+         ▼
+Step 2 — READ [ contracts ] to verify:
+         • status is IN_PROGRESS, DELIVERED, or FUNDED
+         • requester is client_id or freelancer_id on that contract
+         │
+         ▼
+Step 3 — WRITE to [ disputes ]
+         │  • id           = new UUID
+         │  • contract_id  = contracts.id (FK)
+         │  • raised_by    = requesting user UUID (FK → users)
+         │  • reason       = NON_DELIVERY | QUALITY_NOT_MET | SCOPE_DISAGREEMENT |
+         │                   LATE_DELIVERY | PAYMENT_WITHHELD | OTHER
+         │  • status       = RAISED
+         │  • assigned_to  = NULL (not yet assigned)
+         │  • created_at   = now()
+         │
+         ▼
+Step 4 — UPDATE [ contracts ]
+         │  • status = DISPUTED
+         │  Funds remain LOCKED — neither party can access them
+         │
+         ▼
+Step 5 — WRITE to [ audit_logs ]
+         │  Action: DISPUTE_RAISED
+         │
+         ▼
+Step 6 — WRITE to [ notifications ]
+         │  Recipient 1: other party  — "A dispute has been raised. Submit evidence."
+         │  Recipient 2: admin queue  — "New dispute requires assignment."
+         │  Channel: EMAIL + SMS
+         │
+         ▼
+Step 7 — Admin assigns moderator
+         PATCH /api/v1/admin/disputes/:id/assign
+         │
+         ▼
+Step 8 — UPDATE [ disputes ]
+         │  • status      = UNDER_REVIEW
+         │  • assigned_to = moderator's users.id (FK → users)
+         │
+         ▼
+Step 9 — Both parties submit evidence
+         POST /api/v1/disputes/:id/evidence
+         Files uploaded to S3; references stored in disputes.terms (JSONB)
+         │
+         ▼
+Step 10 — UPDATE [ disputes ]
+          │  • status = EVIDENCE_SUBMITTED
+          │
+          ▼
+Step 11 — Moderator reviews evidence and makes decision
+          POST /api/v1/admin/disputes/:id/resolve
+          Body: { resolution_type, resolution_note }
+          │
+          ▼
+Step 12 — UPDATE [ disputes ]
+          │  • status           = RESOLVED
+          │  • resolution_type  = FULL_RELEASE | FULL_REFUND | PARTIAL_SPLIT
+          │  • resolution_note  = moderator's written justification
+          │  • resolved_at      = now()
+          │
+          ▼
+Step 13 — Execute resolution (atomic DB transaction):
+          │
+          ├─ FULL_RELEASE:
+          │    UPDATE wallets (client)     locked_balance - total_amount
+          │    UPDATE wallets (freelancer) balance + (total_amount - fee)
+          │    INSERT payments             direction=RELEASE
+          │    UPDATE contracts            status=COMPLETED, completed_at=now()
+          │
+          ├─ FULL_REFUND:
+          │    UPDATE wallets (client)     locked_balance - total_amount
+          │    UPDATE wallets (client)     balance + total_amount
+          │    INSERT payments             direction=REFUND
+          │    UPDATE contracts            status=REFUNDED, cancelled_at=now()
+          │
+          └─ PARTIAL_SPLIT (e.g. 60% freelancer / 40% client):
+               UPDATE wallets (freelancer) balance + split_freelancer_amount
+               UPDATE wallets (client)     locked_balance - total_amount
+               UPDATE wallets (client)     balance + split_client_amount
+               INSERT payments × 2         RELEASE + REFUND records
+               UPDATE contracts            status=COMPLETED
+          │
+          ▼
+Step 14 — WRITE to [ audit_logs ]
+          │  Action: DISPUTE_RESOLVED
+          │  actor_id = moderator
+          │  after_snapshot = {resolution_type, resolution_note}
+          │
+          ▼
+Step 15 — WRITE to [ notifications ]
+          │  Both parties notified of decision via EMAIL + SMS
+          │
+          ▼
+Step 16 — OUTPUT:
+          • Dispute closed with binding decision
+          • Wallets updated per resolution
+          • Both parties receive written decision
+          • Full evidence trail preserved in audit_logs and disputes table
+```
+
+### Escalation Sub-Flow
+
+```
+If either party contests moderator decision:
+  UPDATE [ disputes ] status = ESCALATED
+  Assigned to COMPLIANCE_OFFICER (senior role)
+  New audit_log entry: DISPUTE_ESCALATED
+  New notification to both parties: case escalated
+  Senior officer reviews → same resolution flow from Step 11
+```
+
+---
+
+## 10. Flow 8 — Withdrawal (Payment Out)
+
+**Trigger:** A freelancer requests to withdraw earned funds to their bank or mobile wallet.
+
+### Step-by-Step Data Movement
+
+```
+Step 1 — Freelancer submits withdrawal request
+         POST /api/v1/wallet/withdraw
+         Body: { amount, destination_type, destination_account }
+         │
+         ▼
+Step 2 — Validation checks:
+         READ [ wallets ] WHERE user_id = freelancer_id
+         • available_balance = balance - locked_balance
+         • Requested amount ≤ available_balance → allow
+         • Requested amount > available_balance → reject with 400
+         READ [ users ] to check kyc_tier and is_active = TRUE
+         │
+         ▼
+Step 3 — BEGIN TRANSACTION
+         │
+         ├─ UPDATE [ wallets ]
+         │    balance = balance - withdrawal_amount
+         │    (optimistic lock via version column)
+         │
+         └─ INSERT [ payments ]
+              direction    = WITHDRAWAL
+              user_id      = freelancer UUID
+              contract_id  = NULL (wallet-level withdrawal, not contract-specific)
+              amount       = withdrawal_amount
+              gateway      = JAZZCASH | EASYPAISA | BANK_TRANSFER
+              gateway_ref  = pending (assigned after gateway confirms)
+              status       = PENDING
+         │
+         COMMIT
+         │
+         ▼
+Step 4 — Platform calls payment gateway payout API
+         Gateway processes transfer to freelancer's bank/mobile account
+         │
+         ▼
+Step 5 — Gateway sends confirmation webhook
+         UPDATE [ payments ]
+         │  • gateway_ref = gateway's payout reference
+         │  • status      = SUCCESS | FAILED
+         │
+         ▼
+Step 6 — If FAILED:
+         BEGIN TRANSACTION
+           UPDATE wallets balance = balance + withdrawal_amount  (rollback credit)
+           UPDATE payments status = FAILED
+         COMMIT
+         │
+         ▼
+Step 7 — WRITE to [ audit_logs ]
+         │  Action: WITHDRAWAL_REQUESTED → WITHDRAWAL_PROCESSED
+         │
+         ▼
+Step 8 — WRITE to [ notifications ]
+         │  Event: WITHDRAWAL_PROCESSED
+         │  Channel: SMS + EMAIL
+         │  Payload: "PKR X has been sent to your JazzCash account ending XXXX."
+         │
+         ▼
+Step 9 — OUTPUT:
+         • Freelancer's real-world account credited
+         • wallets.balance reduced permanently
+         • payments record with SUCCESS and gateway_ref
+```
+
+---
+
+## 11. Cross-Cutting Flows — Audit & Notifications
+
+These two flows do not have a single trigger — they are written to **on every state change** across all other flows. They are the platform's memory and communication backbone.
+
+### Audit Log Flow
+
+```
+Every state-changing API call:
+  │
+  ▼
+Application intercept layer (NestJS interceptor)
+  │  Captures: actor_id, action_name, entity_type, entity_id,
+  │            before_state (snapshot before DB write),
+  │            after_state  (snapshot after DB write),
+  │            ip_address, user_agent
+  │
+  ▼
+WRITE to [ audit_logs ]
+  │  chain_hash = SHA-256(previous_log_hash + current_entry_content)
+  │  This creates a tamper-evident chain:
+  │  if any historical log entry is modified, the hash chain breaks
+  │
+  ▼
+No further dependencies — audit_logs is a write-only append table
+READ only by: admin dashboard, compliance export, legal discovery
+```
+
+### Notification Flow
+
+```
+Every domain event emitted by a service:
+  ContractFunded | DeliverySubmitted | DisputeRaised | FundsReleased | etc.
+  │
+  ▼
+NestJS EventEmitter fires event
+  │
+  ▼
+NotificationService subscribes and determines:
+  • Which users receive this notification
+  • Which channels (EMAIL / SMS / IN_APP) based on user preferences
+  • Which template to use (subject + body with variable injection)
+  │
+  ▼
+Job pushed to BullMQ queue (Redis-backed)
+  │  Async — does not block the original API request
+  │
+  ▼
+BullMQ worker picks up job and dispatches:
+  EMAIL  → SendGrid API
+  SMS    → Twilio API (Jazz/Telenor/Ufone)
+  IN_APP → WebSocket push to connected session
+  │
+  ▼
+WRITE to [ notifications ]
+  │  • status = SENT | FAILED
+  │  • sent_at = timestamp of successful dispatch
+  │
+  ▼
+On FAILED: automatic retry (3 attempts with exponential backoff)
+After 3 failures: status = FAILED, admin alert triggered
+```
+
+---
+
+## 12. Table Dependency Map
+
+This section shows the **full dependency tree** — which tables must exist before others can receive data.
+
+### Dependency Levels
+
+```
+LEVEL 0 — No dependencies (created independently):
+┌─────────────────────────────────────────────┐
+│                  users                       │
+│  (Root table. Everything depends on this.)   │
+└─────────────────────────────────────────────┘
+
+LEVEL 1 — Depend only on users:
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   wallets    │  │kyc_documents │  │  audit_logs  │
+│(user_id FK)  │  │(user_id FK)  │  │(actor_id FK) │
+└──────────────┘  └──────────────┘  └──────────────┘
+┌──────────────┐
+│notifications │
+│(user_id FK)  │
+└──────────────┘
+
+LEVEL 2 — Depend on users × 2 (client + freelancer):
+┌────────────────────────────────────────────┐
+│               contracts                    │
+│  (client_id FK → users)                    │
+│  (freelancer_id FK → users)                │
+└────────────────────────────────────────────┘
+
+LEVEL 3 — Depend on contracts (and indirectly users):
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   payments   │  │  milestones  │  │   disputes   │
+│(contract_id) │  │(contract_id) │  │(contract_id) │
+│(user_id)     │  │              │  │(raised_by)   │
+└──────────────┘  └──────────────┘  │(assigned_to) │
+                                     └──────────────┘
+```
+
+### Insertion Order (Required for FK Integrity)
+
+```
+1. users          ← must be inserted first, always
+2. wallets        ← after users (one per user)
+3. kyc_documents  ← after users
+4. contracts      ← after users (needs client_id and freelancer_id)
+5. milestones     ← after contracts
+6. payments       ← after contracts and users
+7. disputes       ← after contracts and users
+8. audit_logs     ← after users (but written continuously alongside all others)
+9. notifications  ← after users (but written continuously alongside all others)
+```
+
+### Foreign Key Reference Table
+
+| Table | Column | References |
+|---|---|---|
+| `wallets` | `user_id` | `users.id` |
+| `kyc_documents` | `user_id` | `users.id` |
+| `kyc_documents` | `reviewed_by` | `users.id` |
+| `contracts` | `client_id` | `users.id` |
+| `contracts` | `freelancer_id` | `users.id` |
+| `payments` | `contract_id` | `contracts.id` |
+| `payments` | `user_id` | `users.id` |
+| `milestones` | `contract_id` | `contracts.id` |
+| `disputes` | `contract_id` | `contracts.id` |
+| `disputes` | `raised_by` | `users.id` |
+| `disputes` | `assigned_to` | `users.id` |
+| `audit_logs` | `actor_id` | `users.id` |
+| `notifications` | `user_id` | `users.id` |
+
+---
+
+## 13. Data Outputs — What the System Produces
+
+The data that moves through PakEscrow's tables produces the following outputs, consumed by users, admins, and external systems.
+
+### User-Facing Outputs
+
+| Output | Source Tables Read | Consumer |
+|---|---|---|
+| Freelancer dashboard — active contracts | `contracts`, `milestones`, `users` | Freelancer |
+| Client dashboard — funded contracts | `contracts`, `payments`, `wallets` | Client |
+| Wallet balance and available funds | `wallets` | Both |
+| Transaction history / ledger | `payments`, `contracts` | Both |
+| Earnings statement (PDF/CSV export) | `payments`, `contracts`, `milestones` | Freelancer |
+| Contract detail page | `contracts`, `milestones`, `payments`, `disputes` | Both |
+| Dispute status and timeline | `disputes`, `audit_logs` | Both |
+| KYC status | `kyc_documents`, `users` | User |
+| Notification inbox | `notifications` | Both |
+| Contract receipt (on completion) | `contracts`, `payments`, `users` | Both |
+
+### Admin-Facing Outputs
+
+| Output | Source Tables Read | Consumer |
+|---|---|---|
+| Platform transaction volume report | `contracts`, `payments` | Admin |
+| KYC review queue | `kyc_documents`, `users` | Compliance Officer |
+| Dispute moderation console | `disputes`, `contracts`, `users` | Moderator |
+| User management panel | `users`, `wallets`, `kyc_documents` | Admin |
+| Audit log explorer | `audit_logs` | Compliance Officer |
+| Fee revenue report | `payments` WHERE direction=RELEASE | Admin |
+| Suspicious activity flags | `audit_logs`, `payments`, `users` | Compliance Officer |
+
+### System-Internal Outputs
+
+| Output | Tables Involved | Consumer |
+|---|---|---|
+| JWT access and refresh tokens | `users` (validated against) | API client sessions |
+| BullMQ notification jobs | Written from domain events, read by worker | Notification worker |
+| Payment gateway callback results | Written to `payments` | Webhook handler |
+| Audit chain hash verification | `audit_logs` | Compliance/forensic tool |
+
+---
+
+## 14. End-to-End Data Flow Summary
+
+The diagram below shows the complete sequence of table writes and reads across the full lifecycle of a single contract — from user registration to fund release.
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║            PAKESCROW — COMPLETE DATA FLOW LIFECYCLE                  ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  [REGISTRATION]                                                      ║
+║   WRITE users → WRITE wallets → WRITE audit_logs → WRITE notif.    ║
+║                                                                      ║
+║  [KYC SUBMISSION]                                                    ║
+║   WRITE kyc_documents → WRITE audit_logs → WRITE notifications      ║
+║   (Admin) UPDATE kyc_documents → UPDATE users.kyc_tier              ║
+║                                                                      ║
+║  [CONTRACT CREATION]                                                 ║
+║   READ users (validate FKs)                                          ║
+║   WRITE contracts → WRITE milestones → WRITE notifications          ║
+║   WRITE audit_logs                                                   ║
+║                                                                      ║
+║  [FREELANCER ACCEPTS]                                                ║
+║   UPDATE contracts.status → WRITE audit_logs → WRITE notifications  ║
+║                                                                      ║
+║  [ESCROW FUNDING]                                                    ║
+║   WRITE payments (DEPOSIT)                                           ║
+║   UPDATE wallets.locked_balance ↑                                    ║
+║   UPDATE contracts.status = FUNDED                                   ║
+║   UPDATE milestones.status = IN_PROGRESS                             ║
+║   WRITE audit_logs → WRITE notifications                             ║
+║                                                                      ║
+║  [DELIVERY SUBMISSION]                                               ║
+║   UPDATE contracts.status = DELIVERED                                ║
+║   UPDATE milestones.status = DELIVERED                               ║
+║   WRITE audit_logs → WRITE notifications (→ client)                  ║
+║                                                                      ║
+║  [APPROVAL & RELEASE]                                                ║
+║   UPDATE wallets.locked_balance ↓ (client)                          ║
+║   UPDATE wallets.balance ↑       (freelancer)                        ║
+║   WRITE payments (RELEASE)                                           ║
+║   UPDATE contracts.status = COMPLETED                                ║
+║   WRITE audit_logs → WRITE notifications (both parties)             ║
+║                                                                      ║
+║  ─── OR ─── [DISPUTE PATH] ──────────────────────────────────────── ║
+║   WRITE disputes                                                     ║
+║   UPDATE contracts.status = DISPUTED (funds remain locked)          ║
+║   WRITE audit_logs → WRITE notifications                             ║
+║   (Admin) UPDATE disputes.assigned_to, status                       ║
+║   (Resolution) UPDATE wallets × 2                                    ║
+║   WRITE payments (RELEASE or REFUND or SPLIT)                        ║
+║   UPDATE contracts.status = COMPLETED | REFUNDED                    ║
+║   WRITE audit_logs → WRITE notifications                             ║
+║                                                                      ║
+║  [WITHDRAWAL]                                                        ║
+║   UPDATE wallets.balance ↓                                           ║
+║   WRITE payments (WITHDRAWAL)                                        ║
+║   WRITE audit_logs → WRITE notifications                             ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  DATA ENTERS:  Registration form, KYC uploads, Contract form,        ║
+║                Payment gateway webhooks                              ║
+║  DATA MOVES:   users → wallets/kyc → contracts → milestones/        ║
+║                payments/disputes → audit_logs + notifications        ║
+║  DATA EXITS:   Dashboards, reports, PDF statements, SMS/email alerts,║
+║                Compliance exports, fund transfers to bank/wallet     ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+*This Data Flow document corresponds to the PakEscrow ERD (`pakescrow_erd.xml`), the database schema (`README.md`), and the ERD explanation guide (`ERD_README.md`).*
