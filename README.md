@@ -1,4 +1,4 @@
-# TrustLink 🔐
+# TrustLink
 
 > **Pakistan's trusted digital escrow infrastructure — securing transactions between buyers and sellers across freelance, commerce, and B2B markets.**
 ## Table of Contents
