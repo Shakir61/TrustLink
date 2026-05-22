@@ -1,0 +1,11 @@
+-- Precise Exact-Count Audit (Deep Verification)
+-- Compiles explicit row counts across core transactional entities.
+
+SELECT 
+    (SELECT COUNT(*) FROM users) AS exact_user_count,
+    (SELECT COUNT(*) FROM user_profiles) AS exact_profile_count,
+    (SELECT COUNT(*) FROM contracts) AS exact_contract_count,
+    (SELECT COUNT(*) FROM milestones) AS exact_milestone_count,
+    (SELECT COUNT(*) FROM payments) AS exact_payment_count,
+    (SELECT COUNT(*) FROM currencies) AS exact_currency_count;
+
