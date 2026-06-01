@@ -19,7 +19,7 @@ The central entity of the platform. Stores all registered users (both clients an
 | `role` | ENUM | Role on the platform (client / freelancer) |
 | `kyc_tier` | SMALLINT | Know Your Customer verification level |
 | `is_active` | BOOLEAN | Account status |
-| `created_at` | TIMESTAMPTZ | Registration timestamp |
+| `created_at` | TIMESTAMP | Registration timestamp |
 
 ---
 
@@ -87,9 +87,9 @@ The core business entity representing an agreement between a client and a freela
 | `currency_code` | VARCHAR (FK → currencies) | Contract currency |
 | `status` | ENUM | Current contract status |
 | `max_revisions / revision_count` | — | Allowed and used revision counts |
-| `delivery_deadline` | TIMESTAMPTZ | Final delivery date |
-| `funded_at / completed_at / cancelled_at` | TIMESTAMPTZ | Key lifecycle timestamps |
-| `created_at / updated_at` | TIMESTAMPTZ | Audit timestamps |
+| `delivery_deadline` | TIMESTAMP | Final delivery date |
+| `funded_at / completed_at / cancelled_at` | TIMESTAMP | Key lifecycle timestamps |
+| `created_at / updated_at` | TIMESTAMP | Audit timestamps |
 
 > Relationships: **N:1** with `users` (client & freelancer), **N:1** with `currencies`, **1:N** with `payments`, `milestones`, `contract_terms`, and `disputes`.
 
@@ -122,8 +122,8 @@ Breaks contracts into trackable, fundable stages.
 | `amount` | NUMERIC(20,4) | Amount tied to this milestone |
 | `sequence` | SMALLINT | Order of the milestone |
 | `status` | ENUM | Current milestone status |
-| `due_date` | TIMESTAMPTZ | Deadline for the milestone |
-| `funded_at / released_at` | TIMESTAMPTZ | Payment lifecycle timestamps |
+| `due_date` | TIMESTAMP | Deadline for the milestone |
+| `funded_at / released_at` | TIMESTAMP | Payment lifecycle timestamps |
 
 > Relationship: **N:1** with `contracts`.
 
@@ -141,7 +141,7 @@ Records all financial transactions on the platform.
 | `gateway_code` | VARCHAR (FK → payment_gateways) | Payment gateway used |
 | `status` | ENUM | Payment status |
 | `direction` | ENUM | Inbound or outbound |
-| `created_at` | TIMESTAMPTZ | Transaction timestamp |
+| `created_at` | TIMESTAMP | Transaction timestamp |
 
 > Relationships: **N:1** with `contracts`, `users`, and `payment_gateways`.
 
@@ -173,7 +173,7 @@ Handles conflict resolution between clients and freelancers.
 | `assigned_to` | UUID (FK → users) | Assigned moderator/admin |
 | `resolution_type` | ENUM | How the dispute was resolved |
 | `resolution_note` | TEXT | Details of resolution |
-| `resolved_at` | TIMESTAMPTZ | Resolution timestamp |
+| `resolved_at` | TIMESTAMP | Resolution timestamp |
 
 > Relationships: **N:1** with `contracts` and `users`.
 
@@ -189,7 +189,7 @@ Stores supporting files and documentation submitted during a dispute.
 | `submitted_by` | UUID (FK → users) | User who uploaded the evidence |
 | `file_s3_key` | TEXT | S3 storage key for the uploaded file |
 | `description` | TEXT | Description of the evidence |
-| `submitted_at` | TIMESTAMPTZ | Submission timestamp |
+| `submitted_at` | TIMESTAMP | Submission timestamp |
 
 > Relationship: **N:1** with `disputes` and `users`.
 
