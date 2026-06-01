@@ -34,14 +34,14 @@ When a transaction is initiated:
 1. The buyer deposits funds into a secure, platform-held escrow wallet.
 2. The seller delivers the agreed product, service, or milestone.
 3. The buyer confirms receipt and satisfaction.
-4. PakEscrow releases the funds to the seller.
+4. TrustLink releases the funds to the seller.
 5. If a dispute arises, TrustLink moderation team adjudicates based on submitted evidence.
 
 The platform is purpose-built for **freelancers**, **online marketplaces**, **social commerce sellers**, **B2B service agreements**, and **real estate/rental deposits**.
 
 ### Why Escrow Matters in Pakistan
 
-| Context | Problem Without Escrow | How PakEscrow Solves It |
+| Context | Problem Without Escrow | How TrustLink Solves It |
 |---|---|---|
 | Freelancers | Clients disappear post-delivery | Funds locked in escrow before work starts |
 | Social Commerce | Buyers send payment; goods never arrive | Seller proves shipment before funds release |
